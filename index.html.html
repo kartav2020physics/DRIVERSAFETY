@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Driver Fatigue Alert / Sürücü Yorgunluk Uyarısı</title>
+<style>
+:root{--bg:#0d1b26;--panel:#16293a;--ink:#e8f0f5;--mute:#8da4b5;--ok:#38d39f;--warn:#f5a623;--bad:#ff4d4f;--st:var(--ok)}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 system-ui,"Segoe UI",Roboto,sans-serif}
+body{padding:max(12px,env(safe-area-inset-top)) 14px max(14px,env(safe-area-inset-bottom));max-width:560px;margin:0 auto}
+.top{display:flex;justify-content:space-between;align-items:center;margin:4px 0 10px}
+h1{font-size:1.05rem;margin:0;font-weight:600;color:var(--mute)}
+#status{background:var(--st);color:#08141c;border-radius:14px;padding:18px 16px;text-align:center;transition:background .25s}
+#status b{display:block;font-size:2rem;line-height:1.1}
+#status span{font-size:.95rem}
+#status.bad{animation:pulse .9s infinite}
+@keyframes pulse{50%{opacity:.6}}
+@media (prefers-reduced-motion:reduce){#status.bad{animation:none}}
+.cam{position:relative;margin:12px 0;border-radius:12px;overflow:hidden;background:#000;aspect-ratio:4/3}
+video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+.bar{height:10px;background:#22394c;border-radius:6px;overflow:hidden;margin:6px 0 12px}
+.bar i{display:block;height:100%;width:0;background:var(--st);transition:width .2s}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.m{background:var(--panel);border-radius:10px;padding:10px 12px}
+.m small{color:var(--mute);display:block;font-size:.78rem}
+.m strong{font-size:1.25rem;font-variant-numeric:tabular-nums}
+.row{display:flex;gap:8px;margin:12px 0;flex-wrap:wrap;align-items:center}
+button,input{font:inherit;border-radius:10px;border:0;padding:12px 14px}
+button{background:#2a7fff;color:#fff;font-weight:600;flex:1;min-width:130px;cursor:pointer}
+button.alt{background:var(--panel);color:var(--ink)}
+#lang{flex:none;min-width:0;padding:8px 12px}
+button:focus-visible,input:focus-visible{outline:3px solid var(--warn);outline-offset:2px}
+input{background:var(--panel);color:var(--ink);width:96px}
+label{color:var(--mute);font-size:.9rem}
+p.note{color:var(--mute);font-size:.82rem}
+details{margin:10px 0;color:var(--mute);font-size:.85rem}
+pre{white-space:pre-wrap;word-break:break-word;font-size:.72rem;background:var(--panel);padding:8px;border-radius:8px;max-height:220px;overflow:auto}
+</style>
+</head>
+<body>
+<div class="top"><h1 data-i="hdr"></h1><button id="lang" class="alt">TR | EN</button></div>
+
+<div id="status"><b id="stT"></b><span id="stS"></span></div>
+<div class="bar"><i id="scoreBar"></i></div>
+
+<div class="cam"><video id="v" playsinline muted></video></div>
+
+<div class="grid">
+  <div class="m"><small data-i="mScore"></small><strong id="mScore">–</strong></div>
+  <div class="m"><small data-i="mPerc"></small><strong id="mPerc">–</strong></div>
+  <div class="m"><small data-i="mEar"></small><strong id="mEar">–</strong></div>
+  <div class="m"><small data-i="mClosed"></small><strong id="mClosed">–</strong></div>
+  <div class="m"><small data-i="mYawn"></small><strong id="mYawn">–</strong></div>
+  <div class="m"><small data-i="mHr"></small><strong id="mHr">–</strong></div>
+  <div class="m"><small data-i="mSpeed"></small><strong id="mSpeed">–</strong></div>
+  <div class="m"><small data-i="mLimit"></small><strong id="mLimit">–</strong></div>
+</div>
+
+<div class="row">
+  <button id="go" data-i="start"></button>
+  <button id="csv" class="alt" data-i="csv"></button>
+</div>
+<div class="row">
+  <label for="limIn" data-i="limitLbl"></label>
+  <input id="limIn" type="number" inputmode="numeric" min="5" max="200" placeholder="90">
+  <label for="spdIn" data-i="testLbl"></label>
+  <input id="spdIn" type="number" inputmode="numeric" min="0" max="250" placeholder="0">
+</div>
+<div class="row">
+  <label for="hrIn" data-i="hrLbl"></label>
+  <input id="hrIn" type="number" inputmode="numeric" min="30" max="220" placeholder="72">
+  <button id="ble" class="alt" data-i="ble"></button>
+</div>
+<details id="diagBox"><summary data-i="diag"></summary><pre id="diagLog"></pre></details>
+<p class="note" data-i="note"></p>
+
+<script>
+const MP_URL="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const MODEL="https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const WASM="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const $=id=>document.getElementById(id);
+function log(m){try{$("diagLog").textContent+=new Date().toLocaleTimeString()+"  "+m+"\n"}catch{}console.log(m)}
+const withTimeout=(p,ms,label)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error("Timeout: "+label+" ("+ms/1000+" s)")),ms))]);
+const isIOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+window.addEventListener("unhandledrejection",e=>log("promise error: "+(e.reason&&e.reason.message||e.reason)));
+
+// ---------- Languages / Diller ----------
+const T={
+tr:{hdr:"Sürücü yorgunluk uyarısı",mScore:"Yorgunluk skoru (0–100)",mPerc:"PERCLOS (son 60 sn)",mEar:"Göz açıklığı (EAR)",mClosed:"Gözler kapalı süre",mYawn:"Esneme (son 5 dk)",mHr:"Nabız (atım/dk)",mSpeed:"Hız (km/s)",mLimit:"Hız limiti (km/s)",
+start:"Başlat",stop:"Durdur",csv:"Verileri indir (CSV)",limitLbl:"Hız limiti:",testLbl:"Test hızı:",hrLbl:"Nabız:",ble:"Saatten bağlan",
+note:"Bu uygulama bir okul projesi prototipidir; sürüş güvenliği için tek başına güvenilmemelidir. Test için araç park halindeyken veya simülasyonda kullanın. Görüntü cihazdan dışarı gönderilmez, kaydedilmez. Hız GPS'ten alınır; simülasyonda 'Test hızı' kutusuna elle yazabilirsiniz.",
+ready:"Hazır",readySub:"Başlat'a basın ve telefonu yüzünüzü görecek şekilde sabitleyin.",
+prep:"Hazırlanıyor…",prepSub:"Kamera izni verin.",loadM:"Model yükleniyor…",loadMSub:"İnternet gerekli, birkaç saniye sürebilir.",
+calib:"Kalibrasyon…",calibSub:"Yola bakın, gözler açık: {n} sn",noFace:"Yüz görünmüyor",noFaceSub:"Telefonu yüzünüzü görecek şekilde ayarlayın.",
+ok:"Uyanık",okSub:"Normal görünüyor.",warn:"Dikkat",warnSub:"Yorgunluk belirtileri artıyor.",
+bad:"YORGUNSUNUZ",badSub:"Güvenli bir yerde durup dinlenin.",eyes:"UYARI! Gözler kapalı",eyesSub:"Yola dikkat edin, mola verin.",
+over:"HIZ LİMİTİ AŞILDI!",overSub:"Hızınız {s} km/s, limit {l} km/s. Yavaşlayın.",
+stopped:"Durduruldu",stoppedSub:"Verileri CSV olarak indirebilirsiniz.",failed:"Başlatılamadı",raw:"{x}",
+bleNo:"Bu tarayıcı Bluetooth'u desteklemiyor. Android'de Chrome kullanın veya nabzı elle girin.",
+bleFail:"Saat bağlanamadı. Saatinizde 'nabzı yayınla' modu açık mı? Değilse nabzı elle girin.",
+noLog:"Henüz kayıt yok.",csvHead:"zaman,EAR,PERCLOS,MAR,esneme_sayisi,nabiz,hiz_kmh,limit_kmh,skor",file:"yorgunluk-verisi.csv"},
+en:{hdr:"Driver fatigue alert",mScore:"Fatigue score (0–100)",mPerc:"PERCLOS (last 60 s)",mEar:"Eye openness (EAR)",mClosed:"Eyes closed for",mYawn:"Yawns (last 5 min)",mHr:"Heart rate (bpm)",mSpeed:"Speed (km/h)",mLimit:"Speed limit (km/h)",
+start:"Start",stop:"Stop",csv:"Download data (CSV)",limitLbl:"Speed limit:",testLbl:"Test speed:",hrLbl:"Pulse:",ble:"Connect watch",
+note:"This app is a school project prototype and must not be relied on alone for driving safety. Test it while parked or in a simulator. Video never leaves the device and is not saved. Speed comes from GPS; in a simulator you can type it into the 'Test speed' box.",
+ready:"Ready",readySub:"Press Start and fix the phone so it can see your face.",
+prep:"Preparing…",prepSub:"Please allow camera access.",loadM:"Loading model…",loadMSub:"Internet required, may take a few seconds.",
+calib:"Calibrating…",calibSub:"Look at the road, eyes open: {n} s",noFace:"Face not visible",noFaceSub:"Adjust the phone so it can see your face.",
+ok:"Alert",okSub:"Looks normal.",warn:"Caution",warnSub:"Signs of fatigue are increasing.",
+bad:"YOU ARE TIRED",badSub:"Stop somewhere safe and rest.",eyes:"WARNING! Eyes closed",eyesSub:"Watch the road and take a break.",
+over:"SPEED LIMIT EXCEEDED!",overSub:"Your speed is {s} km/h, limit is {l} km/h. Slow down.",
+stopped:"Stopped",stoppedSub:"You can download the data as CSV.",failed:"Could not start",raw:"{x}",
+bleNo:"This browser does not support Bluetooth. Use Chrome on Android or enter the pulse by hand.",
+bleFail:"Could not connect to the watch. Is 'broadcast heart rate' enabled? If not, enter the pulse by hand.",
+noLog:"No data recorded yet.",csvHead:"time,EAR,PERCLOS,MAR,yawn_count,heart_rate,speed_kmh,limit_kmh,score",file:"fatigue-data.csv"}
+};
+Object.assign(T.tr,{diag:"Tanılama (bir şey çalışmazsa buraya bakın)",insecure:"Kamera kullanılamıyor: sayfa https ile ve Safari/Chrome'da açılmalı. WhatsApp, Instagram gibi uygulama içi tarayıcıları kullanmayın.",stepCam:"Kamera açılıyor…",stepLib:"Kütüphane yükleniyor…",stepModel:"Yüz modeli yükleniyor (ilk seferde 10-30 sn)…",lost:"Kamera görüntüsü işlenemiyor"});
+Object.assign(T.en,{diag:"Diagnostics (check here if something fails)",insecure:"Camera unavailable: open the page over https in Safari/Chrome. Do not use in-app browsers such as WhatsApp or Instagram.",stepCam:"Starting camera…",stepLib:"Loading library…",stepModel:"Loading face model (10-30 s the first time)…",lost:"Cannot process the camera image"});
+let lang=(navigator.language||"tr").toLowerCase().startsWith("tr")?"tr":"en";
+const t=(k,p)=>(T[lang][k]||k).replace(/\{(\w+)\}/g,(_,x)=>p&&p[x]!==undefined?p[x]:"");
+let last=["ok","ready","readySub",null,880];
+function render(){
+  document.documentElement.lang=lang;
+  document.querySelectorAll("[data-i]").forEach(e=>{
+    const k=e.dataset.i;e.textContent=(k==="start"&&run)?t("stop"):t(k)});
+  $("stT").textContent=t(last[1],last[3]);$("stS").textContent=t(last[2],last[3]);
+  $("mLimit").textContent=S.limit||"–";
+}
+$("lang").onclick=()=>{lang=lang==="tr"?"en":"tr";try{localStorage.setItem("lang",lang)}catch{}render()};
+try{const sv=localStorage.getItem("lang");if(sv)lang=sv}catch{}
+
+// ---------- Settings / Ayarlar ----------
+const CFG={calibMs:6000,closedRatio:0.70,closedAlarmMs:1500,yawnMAR:0.6,yawnMs:1500,
+           perclosWin:60000,yawnWin:300000,warnScore:35,badScore:60,headDev:0.15};
+
+let lm,stream,ctx,run=false,wake,alarmT,alarmF=880,FaceLandmarker,FilesetResolver,gpsId=null;
+let S;
+function reset(){S={t0:0,calib:[],calibN:[],earBase:null,noseBase:null,hist:[],closedSince:0,yawnSince:0,yawnLatched:false,
+  yawns:[],headSince:0,headSince2:0,hr:null,hrT0:0,hr0:[],hrBase:null,log:[],lastLog:0,noFace:0,
+  limit:S?S.limit:0,gps:null,manual:S?S.manual:null}}
+reset();
+
+const d=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const ear=(p,i)=>(d(p[i[1]],p[i[5]])+d(p[i[2]],p[i[4]]))/(2*d(p[i[0]],p[i[3]]));
+const R=[33,160,158,133,153,144], L=[362,385,387,263,373,380];
+const med=a=>{const s=[...a].sort((x,y)=>x-y);return s[Math.floor(s.length/2)]};
+const clamp=(x,a,b)=>Math.min(b,Math.max(a,x));
+
+function beep(){
+  if(!ctx)return;
+  const o=ctx.createOscillator(),g=ctx.createGain();
+  o.type="square";o.frequency.value=alarmF;g.gain.value=0.3;
+  o.connect(g);g.connect(ctx.destination);o.start();o.stop(ctx.currentTime+0.35);
+  if(navigator.vibrate)navigator.vibrate([300,150,300]);
+}
+function setLevel(l,title,sub,p,freq){
+  last=[l,title,sub,p,freq];alarmF=freq||880;
+  const c={ok:"--ok",warn:"--warn",bad:"--bad"}[l];
+  document.documentElement.style.setProperty("--st",`var(${c})`);
+  $("status").className=l==="bad"?"bad":"";
+  $("stT").textContent=t(title,p);$("stS").textContent=t(sub,p);
+  if(l==="bad"&&!alarmT){beep();alarmT=setInterval(beep,900)}
+  if(l!=="bad"&&alarmT){clearInterval(alarmT);alarmT=null}
+}
+
+// ---------- Heart rate / Nabız ----------
+function setHR(v){
+  if(!(v>30&&v<220))return;
+  const now=Date.now();
+  if(!S.hrT0)S.hrT0=now;
+  S.hr=v;
+  if(now-S.hrT0<60000){S.hr0.push(v);S.hrBase=S.hr0.reduce((a,b)=>a+b)/S.hr0.length}
+  $("mHr").textContent=v;
+}
+$("hrIn").addEventListener("change",e=>setHR(+e.target.value));
+$("ble").onclick=async()=>{
+  if(!navigator.bluetooth){alert(t("bleNo"));return}
+  try{
+    const dev=await navigator.bluetooth.requestDevice({filters:[{services:["heart_rate"]}]});
+    const srv=await dev.gatt.connect();
+    const ch=await (await srv.getPrimaryService("heart_rate")).getCharacteristic("heart_rate_measurement");
+    await ch.startNotifications();
+    ch.addEventListener("characteristicvaluechanged",e=>{
+      const dv=e.target.value;setHR((dv.getUint8(0)&1)?dv.getUint16(1,true):dv.getUint8(1));
+    });
+  }catch(err){alert(t("bleFail"))}
+};
+
+// ---------- Speed / Hız ----------
+$("limIn").addEventListener("input",e=>{S.limit=+e.target.value||0;$("mLimit").textContent=S.limit||"–"});
+$("spdIn").addEventListener("input",e=>{const v=e.target.value;S.manual=v===""?null:+v});
+const speed=()=>S.manual!=null?S.manual:S.gps;   // test value overrides GPS
+function startGPS(){
+  if(!navigator.geolocation||gpsId!==null)return;
+  gpsId=navigator.geolocation.watchPosition(
+    pos=>{S.gps=pos.coords.speed!=null?pos.coords.speed*3.6:null},
+    ()=>{},{enableHighAccuracy:true,maximumAge:1000});
+}
+function stopGPS(){if(gpsId!==null){navigator.geolocation.clearWatch(gpsId);gpsId=null}}
+
+// ---------- Main loop ----------
+let errCount=0,recovering=false,curDel="CPU",lastVT=-1;
+function frame(){
+  if(!run)return;
+  requestAnimationFrame(frame);
+  try{step();errCount=0}catch(e){
+    log("frame error: "+(e&&e.message));
+    if(++errCount>=5&&!recovering)recover(e);
+  }
+}
+async function recover(e){
+  recovering=true;
+  try{
+    if(curDel==="GPU"){log("switching to CPU");lm=await makeLM("CPU");curDel="CPU";errCount=0}
+    else setLevel("warn","lost","raw",{x:e&&e.message});
+  }catch(err){setLevel("warn","failed","raw",{x:err.message})}
+  recovering=false;
+}
+function step(){
+  const v=$("v");if(v.readyState<2||!v.videoWidth)return;
+  if(v.currentTime===lastVT)return;lastVT=v.currentTime;
+  const now=performance.now();
+  const res=lm.detectForVideo(v,now);
+  const spd=speed();
+  $("mSpeed").textContent=spd!=null?Math.round(spd):"–";
+  const over=spd!=null&&S.limit>0&&spd>S.limit;
+  if(!res.faceLandmarks.length){
+    if(!S.noFace)S.noFace=now;
+    if(over)setLevel("bad","over","overSub",{s:Math.round(spd),l:S.limit},440);
+    else if(now-S.noFace>2500)setLevel("warn","noFace","noFaceSub");
+    return;
+  }
+  S.noFace=0;
+  const W=v.videoWidth,H=v.videoHeight;
+  const p=res.faceLandmarks[0].map(q=>({x:q.x*W,y:q.y*H}));
+  const e=(ear(p,R)+ear(p,L))/2;
+  const mar=d(p[13],p[14])/d(p[78],p[308]);
+  const nose=(p[1].y-p[10].y)/(p[152].y-p[10].y);
+
+  if(!S.t0)S.t0=now;
+  if(S.earBase===null){
+    S.calib.push(e);S.calibN.push(nose);
+    const left=Math.max(Math.ceil((CFG.calibMs-(now-S.t0))/1000),0);
+    if(over)setLevel("bad","over","overSub",{s:Math.round(spd),l:S.limit},440);
+    else setLevel("ok","calib","calibSub",{n:left});
+    if(now-S.t0>=CFG.calibMs){S.earBase=med(S.calib);S.noseBase=med(S.calibN)}
+    return;
+  }
+
+  const closed=e<S.earBase*CFG.closedRatio;
+  S.hist.push([now,closed?1:0]);
+  while(S.hist[0][0]<now-CFG.perclosWin)S.hist.shift();
+  const perclos=S.hist.reduce((a,x)=>a+x[1],0)/S.hist.length;
+  if(closed){if(!S.closedSince)S.closedSince=now}else S.closedSince=0;
+  const closedFor=S.closedSince?now-S.closedSince:0;
+
+  if(mar>CFG.yawnMAR){
+    if(!S.yawnSince)S.yawnSince=now;
+    if(!S.yawnLatched&&now-S.yawnSince>CFG.yawnMs){S.yawns.push(now);S.yawnLatched=true}
+  }else{S.yawnSince=0;S.yawnLatched=false}
+  while(S.yawns.length&&S.yawns[0]<now-CFG.yawnWin)S.yawns.shift();
+
+  const headOff=Math.abs(nose-S.noseBase)/S.noseBase>CFG.headDev;
+  if(headOff){if(!S.headSince)S.headSince=now}else S.headSince=0;
+  const headLong=S.headSince&&now-S.headSince>2000;
+
+  const hrDrop=(S.hr&&S.hrBase&&Date.now()-S.hrT0>60000)?Math.max(0,(S.hrBase-S.hr)/S.hrBase):0;
+
+  // Score: eyes 50 + yawns 20 + head 15 + heart-rate drop 15
+  const score=Math.round(
+    clamp(perclos/0.20,0,1)*50+clamp(S.yawns.length/3,0,1)*20+(headLong?15:0)+clamp(hrDrop/0.15,0,1)*15);
+
+  if(closedFor>CFG.closedAlarmMs)setLevel("bad","eyes","eyesSub");
+  else if(score>=CFG.badScore)setLevel("bad","bad","badSub");
+  else if(over)setLevel("bad","over","overSub",{s:Math.round(spd),l:S.limit},440);
+  else if(score>=CFG.warnScore)setLevel("warn","warn","warnSub");
+  else setLevel("ok","ok","okSub");
+
+  $("mScore").textContent=score;$("scoreBar").style.width=score+"%";
+  $("mPerc").textContent=(perclos*100).toFixed(0)+"%";
+  $("mEar").textContent=e.toFixed(2);
+  $("mClosed").textContent=(closedFor/1000).toFixed(1)+(lang==="tr"?" sn":" s");
+  $("mYawn").textContent=S.yawns.length;
+
+  if(now-S.lastLog>=1000){
+    S.lastLog=now;
+    S.log.push([new Date().toISOString(),e.toFixed(3),perclos.toFixed(3),mar.toFixed(3),S.yawns.length,S.hr??"",spd!=null?Math.round(spd):"",S.limit||"",score]);
+  }
+}
+
+let fsr;
+async function makeLM(del){
+  if(!fsr)fsr=await withTimeout(FilesetResolver.forVisionTasks(WASM),30000,"wasm");
+  return withTimeout(FaceLandmarker.createFromOptions(fsr,{baseOptions:{modelAssetPath:MODEL,delegate:del},runningMode:"VIDEO",numFaces:1}),90000,"model "+del);
+}
+$("go").onclick=async()=>{
+  if(run){
+    run=false;stream.getTracks().forEach(x=>x.stop());clearInterval(alarmT);alarmT=null;stopGPS();
+    if(wake)wake.release().catch(()=>{});
+    setLevel("ok","stopped","stoppedSub");render();return;
+  }
+  try{
+    $("diagLog").textContent="";log("start · iOS="+isIOS+" · secure="+window.isSecureContext+" · "+navigator.userAgent);
+    if(!window.isSecureContext||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){setLevel("warn","failed","insecure");return}
+    ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();ctx.resume();
+    reset();
+    setLevel("ok","prep","stepCam");log("1/4 camera");
+    stream=await withTimeout(navigator.mediaDevices.getUserMedia({video:{facingMode:"user"},audio:false}),30000,"camera");
+    const v=$("v");v.muted=true;v.setAttribute("playsinline","");v.srcObject=stream;
+    try{await v.play()}catch(e){log("video.play: "+e.message)}
+    log("camera ok "+v.videoWidth+"x"+v.videoHeight);
+    startGPS();
+    if(!lm){
+      setLevel("ok","loadM","stepLib");log("2/4 library");
+      if(!FaceLandmarker){const m=await withTimeout(import(MP_URL),30000,"library (jsdelivr)");FaceLandmarker=m.FaceLandmarker;FilesetResolver=m.FilesetResolver}
+      setLevel("ok","loadM","stepModel");log("3/4 model");
+      const pref=isIOS?"CPU":"GPU";
+      try{lm=await makeLM(pref);curDel=pref}
+      catch(e){log(pref+" failed: "+e.message);const alt=pref==="GPU"?"CPU":"GPU";lm=await makeLM(alt);curDel=alt}
+      log("model ready ("+curDel+")");
+    }
+    try{wake=await navigator.wakeLock.request("screen")}catch{}
+    log("4/4 running");lastVT=-1;
+    run=true;render();requestAnimationFrame(frame);
+  }catch(err){
+    log("START FAILED: "+(err&&(err.name+": "+err.message)));
+    try{stream&&stream.getTracks().forEach(x=>x.stop())}catch{}
+    setLevel("warn","failed","raw",{x:(err&&(err.name+": "+err.message))||""});
+    $("diagBox").open=true;
+  }
+};
+
+$("csv").onclick=()=>{
+  if(!S.log.length){alert(t("noLog"));return}
+  const txt=t("csvHead")+"\n"+S.log.map(r=>r.join(",")).join("\n");
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([txt],{type:"text/csv"}));
+  a.download=t("file");a.click();
+};
+
+window.addEventListener("error",e=>{log("error: "+e.message);$("stT").textContent="Error";$("stS").textContent=e.message});
+render();
+</script>
+</body>
+</html>
